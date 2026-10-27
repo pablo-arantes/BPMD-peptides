@@ -184,17 +184,38 @@ def parse_arguments():
 
 
 def get_platform(args):
-    """Return (platform, properties) for the Simulation constructor."""
+    """Return (platform, properties) for the Simulation constructor.
+
+    Property names are looked up from the platform itself rather than
+    hard-coded. OpenMM accepts both the plain names ('Precision') and the
+    platform-prefixed ones ('CudaPrecision'), and which of them a platform
+    advertises has changed between versions, so asking avoids guessing.
+    Properties a platform does not support are skipped: the CPU platform
+    has no precision setting, for instance.
+    """
     if args.platform is None:
         return None, None
     platform = Platform.getPlatformByName(args.platform)
+    available = list(platform.getPropertyNames())
+
+    def property_name(suffix):
+        if suffix in available:
+            return suffix
+        matches = [name for name in available if name.endswith(suffix)]
+        return matches[0] if matches else None
+
     properties = {}
-    if args.platform in ("CUDA", "OpenCL", "HIP"):
-        prefix = {"CUDA": "Cuda", "OpenCL": "OpenCL", "HIP": "Hip"}[
-            args.platform]
-        properties[f"{prefix}Precision"] = args.precision
-        if args.device_index is not None:
-            properties[f"{prefix}DeviceIndex"] = args.device_index
+    for suffix, value in (("Precision", args.precision),
+                          ("DeviceIndex", args.device_index)):
+        if value is None:
+            continue
+        name = property_name(suffix)
+        if name is not None:
+            properties[name] = value
+        elif suffix == "DeviceIndex" or args.precision != "mixed":
+            # Only complain when the setting was asked for deliberately
+            print(f"  NOTE: the {platform.getName()} platform has no "
+                  f"'{suffix}' property; ignoring that setting")
     return platform, properties
 
 
