@@ -15,6 +15,22 @@ open-source OpenMM implementation (OpenBPMD), adapted here for **peptide
 ligands** — where the "ligand" is a whole protein chain rather than a small
 molecule, so it is selected by chain instead of by residue name.
 
+## Run it on Google Colab — no GPU needed
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/pablo-arantes/BPMD-peptides/blob/main/BPMD_peptides_Colab.ipynb)
+
+If you do not have a GPU or a cluster, open
+[`BPMD_peptides_Colab.ipynb`](BPMD_peptides_Colab.ipynb) in Colab, switch the
+runtime to a T4 GPU and work through the cells. It installs everything,
+fetches or accepts your structure, runs both stages and plots the scores.
+
+Colab sessions are time-limited, so mount Google Drive when the notebook asks:
+finished replicas are skipped on re-run, which means a full 10 × 10 ns job can
+be completed across several sessions. Start with one short replica to check
+your system and measure the speed before committing to the full protocol.
+
+---
+
 Two scripts, run in order:
 
 | Stage | Script | What it does |
@@ -30,6 +46,7 @@ Two scripts, run in order:
 
 ## Table of contents
 
+- [Run it on Google Colab](#run-it-on-google-colab--no-gpu-needed)
 - [The scores](#the-scores)
 - [Installation](#installation)
 - [Quick start](#quick-start)
@@ -64,6 +81,9 @@ one that leaves the site.
 ---
 
 ## Installation
+
+*(Skip this if you are using the [Colab notebook](#run-it-on-google-colab--no-gpu-needed),
+which installs everything for you.)*
 
 Both stages need a mix of AMBER tooling and Python MD libraries, which is
 easiest through conda. The environment below is the one this pipeline is
