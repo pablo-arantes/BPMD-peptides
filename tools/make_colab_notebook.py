@@ -146,8 +146,13 @@ if not os.path.isdir(REPO):
     print("Cloning BPMD-peptides ...")
     sh(f"git clone --depth 1 https://github.com/pablo-arantes/BPMD-peptides.git {REPO}")
 else:
-    sh(f"cd {REPO} && git pull --ff-only || true")
-print("Pipeline:", sh(f"cd {REPO} && git log --oneline -1").strip())
+    # Hard reset rather than pull: the clone is shallow and nobody should be
+    # editing it, and a silently failed pull would leave stale code running.
+    sh(f"cd {REPO} && git fetch --depth 1 origin main "
+       f"&& git reset --hard origin/main")
+print("Pipeline version:", sh(f"cd {REPO} && git log --oneline -1").strip())
+print("  (if this is not the newest commit, delete /content/BPMD-peptides "
+      "and re-run)")
 
 # --- micromamba (the archive holds bin/micromamba, so this lands at MM) ---
 if not os.path.isfile(MM):
