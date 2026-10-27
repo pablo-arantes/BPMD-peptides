@@ -532,6 +532,10 @@ one Colab session for a typical complex, so the defaults below are smaller.
   whatever is there and is only useful as a smoke test.
 - **Use the same `sim_time` when you resume**, otherwise the window is
   computed from the wrong trajectory length.
+- **`timestep_fs` is 4 fs**, which is what hydrogen mass repartitioning is
+  for: it halves the wall time without changing the metadynamics protocol,
+  which is defined in picoseconds. Drop it to 2 fs only to reproduce runs
+  made before this was fixed. Equilibration always uses 2 fs.
 """)) 
 
 cells.append(code(r"""
@@ -543,6 +547,7 @@ sim_time_ns = 2.0  #@param {type:"number"}
 equilibration_ps = 500.0  #@param {type:"number"}
 hill_height_kcal = 0.5  #@param {type:"number"}
 temperature_K = 300.0  #@param {type:"number"}
+timestep_fs = 4.0  #@param {type:"number"}
 
 import glob, subprocess, sys, time
 
@@ -555,6 +560,7 @@ base_cmd = [PY, "-u", f"{REPO}/run_bpmd.py",    # -u: stream progress live
             "--equil_time", str(equilibration_ps),
             "--hill_height", str(hill_height_kcal),
             "--temperature", str(temperature_K),
+            "--timestep", str(timestep_fs),
             "--platform", "CUDA" if HAS_GPU else "CPU"]
 if receptor_chain > 0:                 # 0 means "infer it"
     base_cmd += ["--receptor_chain", str(receptor_chain)]

@@ -311,9 +311,15 @@ For each complex found in `--work_dir`:
    heavy atoms, restrained to massless dummy particles so a barostat could not
    drag them).
 3. **`--nreps` production replicas**, each 10 ns of well-tempered metadynamics
-   at 300 K with a 2 fs timestep and hydrogen mass repartitioning, biasing the
-   peptide RMSD (hill height 0.5 kcal/mol, σ = 0.02 Å, bias factor 4,
-   deposited every 0.5 ps). 100 frames are written per replica.
+   at 300 K biasing the peptide RMSD (hill height 0.5 kcal/mol, σ = 0.02 Å,
+   bias factor 4, a hill deposited every 1 ps). Hydrogen mass repartitioning
+   to 4 amu lets the integrator take a **4 fs** timestep, which halves the
+   wall time. 100 frames are written per replica.
+
+   The metadynamics cadence is defined in picoseconds and the step counts are
+   derived from the timestep, so `--timestep` changes the speed without
+   changing how fast the bias grows. Equilibration always runs at 2 fs,
+   because it is not HMR'd.
 4. **Scoring** of each replica, then the averages across replicas.
 
 The collective variable is the RMSD of the peptide's heavy atoms together with
@@ -334,6 +340,7 @@ the RMSD well defined under periodic boundary conditions.
 | `--sim_time` | `10.0` | Length of each replica (ns) |
 | `--equil_time` | `1000.0` | Restrained equilibration (ps) |
 | `--temperature` | `300.0` | Temperature (K) |
+| `--timestep` | `4.0` | Production timestep in fs, paired with hydrogen mass repartitioning. Use `2.0` to reproduce pre-0.2 runs |
 | `--platform` | auto | `CUDA`, `OpenCL`, `HIP`, `CPU` or `Reference` |
 | `--precision` | `mixed` | Precision for GPU platforms |
 | `--device_index` | auto | GPU index, e.g. `0` or `0,1` |
@@ -347,7 +354,8 @@ agree.
 ### Cost
 
 Ten 10 ns replicas is 100 ns of metadynamics per complex, plus 1 ns of
-equilibration. On a modern GPU this is a few hours per complex. Scale down
+equilibration. At 4 fs that is 2.5 M steps per replica. On a modern GPU this
+is a few hours per complex. Scale down
 with `--nreps` and `--sim_time` while setting things up — but note the final
 scores average the **last 2 ns**, so runs shorter than that average whatever
 is available and are only useful as smoke tests.
@@ -531,43 +539,63 @@ usability changes; the ones that **change your results** are marked.
 
 ### Stage 2
 
-1. **A real command-line interface** — `argparse` was imported but unused, and
+1. **The production timestep is 4 fs, not 2 fs** *(changes results)* — the
+   original applied hydrogen mass repartitioning but integrated at 2 fs, so
+   HMR bought nothing. The script was half-converted from a 4 fs protocol:
+   its own comments said "4 fs time step", "deposit bias every 1 ps" and
+   "record the CVs every 2 ps", and the deposition interval of 250 steps and
+   CV interval of 500 steps are only those values at 4 fs — while the frame
+   interval, bias-save interval and run length had been rescaled for 2 fs.
+
+   The consequence was not just lost speed. At 2 fs, 250 steps is 0.5 ps, so
+   hills were deposited **twice as fast per nanosecond** as intended, making
+   the bias grow at double the intended rate and the metadynamics
+   correspondingly more aggressive. Every cadence is now defined in
+   picoseconds and the step counts derived from the timestep, so the protocol
+   is 1000 hills/ns at any timestep, and `--timestep 2.0` reproduces the old
+   speed without reintroducing the old bias rate.
+
+   Scores from before this change are not comparable. `run_bpmd.py` warns if
+   it finds replicas that were run with a different timestep, length or hill
+   height, rather than pooling them into one score.
+2. **A real command-line interface** — `argparse` was imported but unused, and
    the working directory was hard-coded to `/content/` (a Colab path). Every
    setting that was a module-level variable is now an option.
-2. **The peptide chain is named explicitly** via the required
+3. **The peptide chain is named explicitly** via the required
    `--peptide_chain`, instead of the peptide being assumed to be the first
    chain in the file. `--receptor_chain` is inferred for a two-chain complex
    and required otherwise.
-3. **Chain detection no longer depends on `TER` alone**, and the fragile
+4. **Chain detection no longer depends on `TER` alone**, and the fragile
    `pdb_file.split('.')[0]` / `name.split('/')[2]` path handling is gone — the
    latter only worked for paths of one exact depth.
-4. **The `-1` residue offset is detected, not assumed** — the analysis
+5. **The `-1` residue offset is detected, not assumed** — the analysis
    selections need it because MDTraj numbers residues from 0 while OpenMM
    numbers them from 1 (both verified). It is now measured from the files, so
    it cannot silently become wrong.
-5. **`not name *H*` → `not name H*`** in the contact selection
+6. **`not name *H*` → `not name H*`** in the contact selection
    *(changes results slightly)* — the glob `*H*` also excluded heavy atoms
    whose names contain an H, such as Arg `NH1`/`NH2` and Tyr `OH`, which are
    precisely the atoms that form interface contacts.
-6. **The hard-coded 99-frame score array** is now sized from the data, so
+7. **The hard-coded 99-frame score array** is now sized from the data, so
    `--sim_time` and the frame count can change without silently truncating or
    zero-padding the scores.
-7. **Velocities are initialised** from the Maxwell-Boltzmann distribution
+8. **Velocities are initialised** from the Maxwell-Boltzmann distribution
    *(changes results)* before equilibration and production, instead of starting
    from zero velocities.
-8. **Scoring windows are expressed in nanoseconds**, so "first 1 ns" and
+9. **Scoring windows are expressed in nanoseconds**, so "first 1 ns" and
    "last 2 ns" stay correct when `--sim_time` changes.
-9. `collect_results` no longer assumes contiguous replica numbering, skips
+10. `collect_results` no longer assumes contiguous replica numbering, skips
    missing or empty files instead of crashing, and pools replicas with
    `np.concatenate` so unequal lengths cannot raise.
-10. Selections are validated up front with actionable errors, instead of
+11. Selections are validated up front with actionable errors, instead of
    failing deep inside the analysis.
-11. The stale-bias-file hazard on restart is now reported.
-12. Written files are closed properly, and the aliasing between
+12. The stale-bias-file hazard on restart is now reported.
+13. Written files are closed properly, and the aliasing between
     `input_positions` and `positions` during restraint setup was removed.
-13. Docstrings corrected: the integrator uses 2 fs (not 4 fs), equilibration
-    is 1 ns (not 500 ps), and bias is deposited every 0.5 ps (not 1 ps).
-14. Added GPU platform selection, a per-replica results file, and a
+14. Docstrings corrected: equilibration is 1 ns, not the 500 ps the docstring
+    claimed. The timestep and bias-interval docstrings are now true as
+    written, as described in point 1.
+15. Added GPU platform selection, a per-replica results file, and a
     per-complex error summary so one bad complex does not abort a batch.
 
 ---

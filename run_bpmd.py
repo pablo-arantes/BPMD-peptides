@@ -32,6 +32,7 @@ from openmm.unit import (kelvin, picosecond, picoseconds, nanometer,
                          nanometers, kilocalories_per_mole,
                          kilojoules_per_mole, angstrom, amu)
 import argparse
+import math
 import numpy as np
 import MDAnalysis as mda
 from MDAnalysis.analysis import rms, contacts
@@ -41,21 +42,33 @@ import glob
 import os
 import re
 import sys
+import warnings
 from sys import stdout
+
+# Reading a single-frame PDB through MDAnalysis has no timestep to report.
+warnings.filterwarnings('ignore', message='Reader has no dt information')
 
 # ---------------------------------------------------------------------
 # Fixed protocol constants. These define the BPMD protocol itself and are
 # deliberately not exposed on the command line.
 # ---------------------------------------------------------------------
-TIMESTEP_PS = 0.002          # 2 fs integration timestep
+# Equilibration runs WITHOUT hydrogen mass repartitioning, so it keeps a
+# conservative 2 fs timestep. Production applies HMR, which is what makes the
+# longer production timestep (--timestep, 4 fs by default) stable.
+EQUIL_TIMESTEP_PS = 0.002    # 2 fs, equilibration (no HMR)
+DEFAULT_TIMESTEP_FS = 4.0    # production timestep, paired with HMR
+HYDROGEN_MASS_AMU = 4        # hydrogen mass repartitioning target
 FRICTION = 1.0               # Langevin friction coefficient, 1/ps
 RESTRAINT_K = 5              # equilibration restraint, kcal/mol/A^2
-BIAS_FREQUENCY = 250         # deposit a hill every 250 steps (0.5 ps)
 BIAS_FACTOR = 4.0            # well-tempered metadynamics bias factor
 HILL_WIDTH = 0.002           # metadynamics sigma, nm
 GRID_MIN, GRID_MAX = 0.0, 1.0   # RMSD CV range, nm
 N_FRAMES = 100               # trajectory frames written per replica
-COLVAR_CHUNK = 500           # steps between CV records (1 ps)
+# The metadynamics cadence is defined in physical time, not in steps, so that
+# changing the timestep does not change how fast the bias grows.
+BIAS_INTERVAL_PS = 1.0       # deposit a hill every 1 ps
+COLVAR_INTERVAL_PS = 2.0     # record the CV every 2 ps
+BIAS_SAVE_NS = 1.0           # write the accumulated bias every 1 ns
 CONTACT_RADIUS = 3.5         # native-contact cutoff, Angstrom
 CONTACT_SHELL = 5            # receptor shell around the peptide, Angstrom
 COMP_CONTACT_WEIGHT = 5      # CompScore = PoseScore - 5 * ContactScore
@@ -139,6 +152,17 @@ def parse_arguments():
         "--temperature", type=float, default=300.0,
         help="Simulation temperature, in K"
     )
+    sim.add_argument(
+        "--timestep", type=float, default=DEFAULT_TIMESTEP_FS,
+        help=(
+            "Production timestep in fs. Hydrogen mass repartitioning is "
+            "applied, which is what makes 4 fs stable and halves the wall "
+            "time. Lower it to 2 fs only to reproduce older runs; the "
+            "metadynamics cadence is defined in picoseconds and is "
+            "unaffected either way. Equilibration always uses 2 fs, since "
+            "it runs without HMR."
+        )
+    )
 
     hw = parser.add_argument_group("hardware")
     hw.add_argument(
@@ -166,6 +190,12 @@ def parse_arguments():
         raise ValueError("--equil_time must be positive")
     if args.hill_height <= 0:
         raise ValueError("--hill_height must be positive")
+    if not (0 < args.timestep <= 5.0):
+        raise ValueError("--timestep must be between 0 and 5 fs")
+    if args.timestep > 4.0:
+        print(f"WARNING: a {args.timestep} fs timestep is longer than the "
+              f"4 fs that hydrogen mass repartitioning is normally paired "
+              f"with; check energy conservation before trusting the result.")
     if args.peptide_chain < 1:
         raise ValueError("--peptide_chain is 1-based, so it must be >= 1")
     if args.receptor_chain is not None:
@@ -401,16 +431,19 @@ def get_contact_score(structure_file, trajectory_file, lig_resname,
                                       radius=CONTACT_RADIUS)
 
     cont_analysis.run()
+    # '.results.timeseries', not '.timeseries': the bare attribute is
+    # deprecated since MDAnalysis 2.0 and goes away in 3.0.
+    timeseries = cont_analysis.results.timeseries
     # Average the contacts over the first nanosecond and use that as the
     # reference the rest of the trajectory is normalised against.
-    n_frames = len(cont_analysis.timeseries)
+    n_frames = len(timeseries)
     frame_idx_first_ns = max(2, int(n_frames * CONTACT_REF_NS / sim_time))
     frame_idx_first_ns = min(frame_idx_first_ns, n_frames)
-    first_ns_mean = np.mean(cont_analysis.timeseries[1:frame_idx_first_ns, 1])
+    first_ns_mean = np.mean(timeseries[1:frame_idx_first_ns, 1])
     if first_ns_mean == 0:
-        normed_contacts = cont_analysis.timeseries[1:, 1]
+        normed_contacts = timeseries[1:, 1]
     else:
-        normed_contacts = cont_analysis.timeseries[1:, 1]/first_ns_mean
+        normed_contacts = timeseries[1:, 1]/first_ns_mean
     contact_scores = np.where(normed_contacts > 1, 1, normed_contacts)
 
     return contact_scores
@@ -443,8 +476,9 @@ def get_pose_score(structure_file, trajectory_file, lig_resname):
     r = rms.RMSD(u, select='backbone',
                  groupselections=[f'{lig_resname} and not name H*'],
                  ref_frame=0).run()
-    # Get the PoseScores as np.array
-    pose_scores = r.rmsd[1:, -1]
+    # Get the PoseScores as np.array. '.results.rmsd', not '.rmsd': the bare
+    # attribute is deprecated since MDAnalysis 2.0 and goes away in 3.0.
+    pose_scores = r.results.rmsd[1:, -1]
 
     return pose_scores
 
@@ -568,13 +602,28 @@ def minimize(parm, input_positions, out_dir, min_file_name,
     # NOTE - no dynamics performed, but required for setting up
     # the OpenMM system.
     integrator = LangevinIntegrator(300*kelvin, FRICTION/picosecond,
-                                    TIMESTEP_PS*picoseconds)
+                                    EQUIL_TIMESTEP_PS*picoseconds)
     simulation = make_simulation(parm.topology, system, integrator,
                                  platform, properties)
     simulation.context.setPositions(input_positions)
 
     # Minimize the system - no predefined number of steps
+    before = simulation.context.getState(
+        getEnergy=True).getPotentialEnergy().value_in_unit(
+            kilojoules_per_mole)
+    print(f"  Potential energy before minimisation: {before:,.1f} kJ/mol")
     simulation.minimizeEnergy()
+    after = simulation.context.getState(
+        getEnergy=True).getPotentialEnergy().value_in_unit(
+            kilojoules_per_mole)
+    print(f"  Potential energy after minimisation:  {after:,.1f} kJ/mol")
+    if math.isnan(after):
+        raise RuntimeError(
+            "Minimisation produced a NaN energy, so the starting structure "
+            "is broken -- check the topology for overlapping atoms or bonds "
+            "stretched across a chain gap (build_topology.py warns about "
+            "those)."
+        )
 
     # Write out the minimized system to use w/ MDAnalysis
     positions = simulation.context.getState(getPositions=True).getPositions()
@@ -663,15 +712,21 @@ def equilibrate(min_pdb, parm, out_dir, eq_file_name, equil_time,
         input_positions.append(positions[i])
 
     integrator = LangevinIntegrator(temperature*kelvin, FRICTION/picosecond,
-                                    TIMESTEP_PS*picoseconds)
+                                    EQUIL_TIMESTEP_PS*picoseconds)
     sim = make_simulation(parm.topology, system, integrator,
                           platform, properties)
     sim.context.setPositions(input_positions)
     sim.context.setVelocitiesToTemperature(temperature*kelvin)
 
-    steps = int(round(equil_time / TIMESTEP_PS))
-    print(f"  Equilibrating for {equil_time} ps ({steps} steps), "
+    steps = int(round(equil_time / EQUIL_TIMESTEP_PS))
+    print(f"  Equilibrating for {equil_time} ps ({steps} steps at "
+          f"{EQUIL_TIMESTEP_PS*1000} fs), "
           f"{len(solute_heavy_atom_idx)} restrained solute heavy atoms ...")
+    # Without a reporter this stage prints nothing for minutes and looks hung
+    sim.reporters.append(StateDataReporter(
+        stdout, max(1000, steps // 10), step=True, progress=True,
+        temperature=True, speed=True, remainingTime=True,
+        totalSteps=steps, separator='\t\t'))
     sim.step(steps)
 
     all_positions = sim.context.getState(
@@ -687,11 +742,11 @@ def equilibrate(min_pdb, parm, out_dir, eq_file_name, equil_time,
 
 
 def produce(out_dir, idx, lig_resname, prot_resname, eq_pdb, parm, parm_file,
-            set_hill_height, sim_time, temperature,
+            set_hill_height, sim_time, temperature, timestep_fs,
             platform=None, properties=None):
     """An OpenBPMD production simulation function. Peptide RMSD is biased
-    with well-tempered metadynamics. The integrator uses a 2 fs time step
-    with hydrogen mass repartitioning, runs for '--sim_time' ns by default
+    with well-tempered metadynamics. Hydrogen mass repartitioning is applied
+    so the integrator can take a 4 fs time step; it runs for '--sim_time' ns
     and writes 100 frames.
 
     Writes a 'trj.dcd', 'COLVAR.npy', 'bias_*.npy' and 'sim_log.csv' files
@@ -719,6 +774,8 @@ def produce(out_dir, idx, lig_resname, prot_resname, eq_pdb, parm, parm_file,
         Length of the replica, in ns.
     temperature : float
         Simulation temperature, in K.
+    timestep_fs : float
+        Production integration timestep, in fs.
     platform, properties :
         Optional OpenMM platform and platform properties.
     """
@@ -753,7 +810,8 @@ def produce(out_dir, idx, lig_resname, prot_resname, eq_pdb, parm, parm_file,
 
     system = parm.createSystem(nonbondedMethod=PME,
                                nonbondedCutoff=1*nanometers,
-                               constraints=HBonds, hydrogenMass=4*amu)
+                               constraints=HBonds,
+                               hydrogenMass=HYDROGEN_MASS_AMU*amu)
     # get the atom positions for the system from the equilibrated
     # system
     input_positions = PDBFile(eq_pdb).getPositions()
@@ -786,16 +844,30 @@ def produce(out_dir, idx, lig_resname, prot_resname, eq_pdb, parm, parm_file,
     rmsd_cv = BiasVariable(rmsd, GRID_MIN, GRID_MAX, hill_width,
                            False, gridWidth=grid)
 
-    steps = int(round(sim_time * 1000 / TIMESTEP_PS))
+    # Every step count below is derived from the timestep so that the
+    # protocol is fixed in physical time: with HMR and a 4 fs timestep a
+    # hill still lands every 1 ps, the CV is still recorded every 2 ps and
+    # the run is still 'sim_time' nanoseconds long.
+    timestep_ps = timestep_fs / 1000.0
+    bias_frequency = max(1, int(round(BIAS_INTERVAL_PS / timestep_ps)))
+    # Keep the CV chunk a whole number of hill depositions
+    colvar_chunk = bias_frequency * max(
+        1, int(round(COLVAR_INTERVAL_PS / BIAS_INTERVAL_PS)))
+
+    steps = int(round(sim_time * 1000 / timestep_ps))
     # Keep the step count a whole number of CV-recording chunks
-    steps = max(COLVAR_CHUNK, (steps // COLVAR_CHUNK) * COLVAR_CHUNK)
+    steps = max(colvar_chunk, (steps // colvar_chunk) * colvar_chunk)
     # Write N_FRAMES frames, on a multiple of the bias deposition period
     report_interval = max(
-        BIAS_FREQUENCY,
-        (steps // N_FRAMES // BIAS_FREQUENCY) * BIAS_FREQUENCY)
-    # Bias is saved every ns, or at the end of a shorter run
-    save_frequency = min(
-        500000, max(BIAS_FREQUENCY, (steps // BIAS_FREQUENCY) * BIAS_FREQUENCY))
+        bias_frequency,
+        (steps // N_FRAMES // bias_frequency) * bias_frequency)
+    # Bias is saved every ns, or at the end of a shorter run.
+    # OpenMM requires saveFrequency to be a multiple of the deposition
+    # frequency, so this is rounded onto that grid.
+    save_every = int(round(BIAS_SAVE_NS * 1000 / timestep_ps))
+    save_frequency = max(
+        bias_frequency,
+        (min(save_every, steps) // bias_frequency) * bias_frequency)
 
     # Stale bias files would be read back in and added to the new run.
     stale_bias = glob.glob(os.path.join(write_dir, 'bias_*.npy'))
@@ -806,14 +878,13 @@ def produce(out_dir, idx, lig_resname, prot_resname, eq_pdb, parm, parm_file,
               f"fresh. Delete the directory for a clean replica.")
 
     # define the metadynamics object
-    # deposit bias every 250 steps (0.5 ps), BF = 4, write bias every ns
     meta = Metadynamics(system, [rmsd_cv], temperature*kelvin, BIAS_FACTOR,
-                        hill_height, BIAS_FREQUENCY, biasDir=write_dir,
+                        hill_height, bias_frequency, biasDir=write_dir,
                         saveFrequency=save_frequency)
 
     # Set up and run metadynamics
     integrator = LangevinIntegrator(temperature*kelvin, FRICTION/picosecond,
-                                    TIMESTEP_PS*picoseconds)
+                                    timestep_ps*picoseconds)
 
     simulation = make_simulation(parm.topology, system, integrator,
                                  platform, properties)
@@ -834,17 +905,19 @@ def produce(out_dir, idx, lig_resname, prot_resname, eq_pdb, parm, parm_file,
                                 remainingTime=True, speed=True,
                                 totalSteps=steps, separator=','))
 
-    print(f"\n> Simulating {steps} steps ({sim_time} ns), writing a frame "
-          f"every {report_interval} steps ...")
+    print(f"\n> Simulating {steps} steps ({sim_time} ns at {timestep_fs} fs "
+          f"with HMR), hill every {bias_frequency} steps "
+          f"({bias_frequency*timestep_ps:.2f} ps), frame every "
+          f"{report_interval} steps "
+          f"({report_interval*timestep_ps/1000:.3f} ns) ...")
 
     colvar_array = np.array([meta.getCollectiveVariables(simulation)])
-    for i in range(0, int(steps), COLVAR_CHUNK):
-        if (i // COLVAR_CHUNK) % 100 == 0:
+    for i in range(0, int(steps), colvar_chunk):
+        if (i // colvar_chunk) % 100 == 0:
             # periodically flush the stored COLVAR to disk
             np.save(os.path.join(write_dir, 'COLVAR.npy'), colvar_array)
-        meta.step(simulation, COLVAR_CHUNK)
+        meta.step(simulation, colvar_chunk)
         current_cvs = meta.getCollectiveVariables(simulation)
-        # record the CVs every 1 ps
         colvar_array = np.append(colvar_array, [current_cvs], axis=0)
     np.save(os.path.join(write_dir, 'COLVAR.npy'), colvar_array)
 
@@ -943,8 +1016,31 @@ def run_complex(args, name, complex_dir):
     prot_resname_analysis = (f"protein and resid "
                              f"{prot_start + offset}:{prot_end + offset}")
 
+    # Replicas from an earlier run used whatever protocol was in force then.
+    # Pooling 2 fs and 4 fs replicas into one score would be wrong, so say so
+    # before adding to them.
+    info_path = os.path.join(complex_dir, 'output_info.txt')
+    existing_reps = glob.glob(os.path.join(output, 'rep_*', 'bpm_results.csv'))
+    if existing_reps and os.path.isfile(info_path):
+        previous = {}
+        with open(info_path) as f:
+            for line in f:
+                if ':' in line:
+                    key, _, value = line.partition(':')
+                    previous[key.strip()] = value.strip()
+        for key, now in [('production timestep',
+                          f"{args.timestep} fs (with HMR)"),
+                         ('sim_time', f"{args.sim_time} ns"),
+                         ('hill_height', f"{args.hill_height} kcal/mol")]:
+            before = previous.get(key)
+            if before is not None and before != now:
+                print(f"  WARNING: {len(existing_reps)} existing replica(s) "
+                      f"were run with {key} = {before}, but this run uses "
+                      f"{now}. Scores from different protocols must not be "
+                      f"pooled -- delete '{output}' to start clean.")
+
     # Record what was actually run, for provenance
-    with open(os.path.join(complex_dir, 'output_info.txt'), 'w') as f:
+    with open(info_path, 'w') as f:
         f.write(f"lig_resname: {lig_resname}\n")
         f.write(f"lig_resname_analysis: {lig_resname_analysis}\n")
         f.write(f"lig_resname_score: {lig_resname_score}\n")
@@ -957,6 +1053,9 @@ def run_complex(args, name, complex_dir):
         f.write(f"sim_time: {args.sim_time} ns\n")
         f.write(f"equil_time: {args.equil_time} ps\n")
         f.write(f"temperature: {args.temperature} K\n")
+        f.write(f"production timestep: {args.timestep} fs (with HMR)\n")
+        f.write(f"equilibration timestep: {EQUIL_TIMESTEP_PS*1000} fs "
+                f"(no HMR)\n")
 
     # Run NREPS number of production simulations
     for idx in range(1, (args.nreps+1)):
@@ -969,7 +1068,7 @@ def run_complex(args, name, complex_dir):
 
         produce(output, idx, lig_resname, prot_resname, eq_pdb, parm,
                 parameters, args.hill_height, args.sim_time,
-                args.temperature, platform, properties)
+                args.temperature, args.timestep, platform, properties)
 
         trj_name = os.path.join(rep_dir, 'trj.dcd')
 
