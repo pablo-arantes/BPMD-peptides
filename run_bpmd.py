@@ -104,13 +104,18 @@ def parse_arguments():
 
     sel = parser.add_argument_group("system definition")
     sel.add_argument(
-        "--lig_chain", type=int, default=1,
-        help="1-based index of the chain that is the PEPTIDE (the biased "
-             "ligand), counted in the order the chains appear in the PDB"
+        "--peptide_chain", type=int, required=True,
+        default=argparse.SUPPRESS,
+        help="REQUIRED. 1-based index of the chain that is the PEPTIDE, "
+             "i.e. the molecule whose pose is biased and scored, counted in "
+             "the order the chains appear in the PDB. The script prints the "
+             "chains it found, so run it once to see the numbering"
     )
     sel.add_argument(
-        "--prot_chain", type=int, default=2,
-        help="1-based index of the chain that is the RECEPTOR"
+        "--receptor_chain", type=int, default=None,
+        help="1-based index of the chain that is the RECEPTOR. May be "
+             "omitted only for a two-chain complex, where it is the chain "
+             "that is not the peptide"
     )
 
     sim = parser.add_argument_group("simulation protocol")
@@ -161,10 +166,15 @@ def parse_arguments():
         raise ValueError("--equil_time must be positive")
     if args.hill_height <= 0:
         raise ValueError("--hill_height must be positive")
-    if args.lig_chain == args.prot_chain:
-        raise ValueError("--lig_chain and --prot_chain must differ")
-    if args.lig_chain < 1 or args.prot_chain < 1:
-        raise ValueError("chain indices are 1-based, so they must be >= 1")
+    if args.peptide_chain < 1:
+        raise ValueError("--peptide_chain is 1-based, so it must be >= 1")
+    if args.receptor_chain is not None:
+        if args.receptor_chain < 1:
+            raise ValueError(
+                "--receptor_chain is 1-based, so it must be >= 1")
+        if args.peptide_chain == args.receptor_chain:
+            raise ValueError(
+                "--peptide_chain and --receptor_chain must differ")
     if args.sim_time < SCORE_WINDOW_NS:
         print(f"WARNING: --sim_time {args.sim_time} ns is shorter than the "
               f"{SCORE_WINDOW_NS} ns scoring window; the final scores will "
@@ -257,13 +267,60 @@ def first_residue_number(pdb_file):
     raise ValueError(f"No ATOM records found in {pdb_file}")
 
 
+def resolve_chains(args, ranges, pdb_file):
+    """Decide which detected chain is the peptide and which the receptor.
+
+    The peptide is always given explicitly, because choosing the wrong
+    molecule produces perfectly plausible numbers for the wrong thing. The
+    receptor may be left out for a two-chain complex, where there is only
+    one candidate.
+
+    Returns
+    -------
+    (int, int) : 1-based indices of the peptide and receptor chains.
+    """
+    detected = ", ".join(
+        f"chain {i} = residues {start}-{end}"
+        for i, (start, end) in enumerate(ranges, 1)
+    )
+
+    if args.peptide_chain > len(ranges):
+        raise ValueError(
+            f"--peptide_chain {args.peptide_chain} was requested, but only "
+            f"{len(ranges)} chain(s) were found in {pdb_file} ({detected}). "
+            f"If the file should have more, and has no TER records, "
+            f"regenerate it with build_topology.py."
+        )
+
+    receptor_chain = args.receptor_chain
+    if receptor_chain is None:
+        if len(ranges) == 2:
+            receptor_chain = 2 if args.peptide_chain == 1 else 1
+            print(f"  --receptor_chain not given; this complex has two "
+                  f"chains, so the receptor is chain {receptor_chain}")
+        else:
+            raise ValueError(
+                f"{len(ranges)} chains were found in {pdb_file} "
+                f"({detected}), so --receptor_chain cannot be inferred. "
+                f"Pass it explicitly alongside --peptide_chain."
+            )
+    elif receptor_chain > len(ranges):
+        raise ValueError(
+            f"--receptor_chain {receptor_chain} was requested, but only "
+            f"{len(ranges)} chain(s) were found in {pdb_file} ({detected})."
+        )
+
+    return args.peptide_chain, receptor_chain
+
+
 def check_selection(universe, selection, what):
     """Make sure a selection matches atoms, with a helpful error if not."""
     n = len(universe.select_atoms(selection))
     if n == 0:
         raise ValueError(
             f"The {what} selection '{selection}' matches no atoms. "
-            f"Check --lig_chain / --prot_chain against the chains detected "
+            f"Check --peptide_chain / --receptor_chain against the chains "
+            f"detected "
             f"in the input PDB."
         )
     return n
@@ -812,19 +869,13 @@ def run_complex(args, name, complex_dir):
     for i, (start, end) in enumerate(ranges, 1):
         print(f"    chain {i}: residues {start}-{end} "
               f"({end - start + 1} residues)")
-    if len(ranges) < max(args.lig_chain, args.prot_chain):
-        raise ValueError(
-            f"Asked for peptide chain {args.lig_chain} and receptor chain "
-            f"{args.prot_chain}, but only {len(ranges)} chain(s) were found "
-            f"in {pdb_ed}. If the file has no TER records, regenerate it "
-            f"with build_topology.py."
-        )
+    peptide_chain, receptor_chain = resolve_chains(args, ranges, pdb_ed)
 
-    lig_start, lig_end = ranges[args.lig_chain - 1]
-    prot_start, prot_end = ranges[args.prot_chain - 1]
-    print(f"  Peptide  = chain {args.lig_chain} "
+    lig_start, lig_end = ranges[peptide_chain - 1]
+    prot_start, prot_end = ranges[receptor_chain - 1]
+    print(f"  Peptide  = chain {peptide_chain} "
           f"(residues {lig_start}-{lig_end})")
-    print(f"  Receptor = chain {args.prot_chain} "
+    print(f"  Receptor = chain {receptor_chain} "
           f"(residues {prot_start}-{prot_end})")
 
     coords = AmberInpcrdFile(structure)

@@ -130,8 +130,9 @@ ls
 # Stage 1: build the AMBER topologies
 python build_topology.py --ff ff14SB --ph 7.4 --ssbond_complex no
 
-# Stage 2: 10 metadynamics replicas per complex
-python run_bpmd.py --nreps 10 --platform CUDA
+# Stage 2: 10 metadynamics replicas per complex.
+# --peptide_chain says which chain is the peptide; it is required.
+python run_bpmd.py --peptide_chain 1 --nreps 10 --platform CUDA
 
 # Final scores
 cat complex1/peptide_pose/results.csv
@@ -151,27 +152,40 @@ structure rather than the code.
 already in the pose you want to test (from docking, a crystal structure, or a
 model).
 
-**2. The peptide must be the first chain and the receptor the second.**
+**2. You tell the script which chain is the peptide.** Chains are numbered in
+the order they appear in the PDB, split on `TER` records and on changes of
+chain ID:
 
 ```
-ATOM  ...  peptide chain  (chain P)
+ATOM  ...  peptide chain  (chain P)   <- chain 1
 TER
-ATOM  ...  receptor chain (chain A)
+ATOM  ...  receptor chain (chain A)   <- chain 2
 TER
 END
 ```
 
-Chains are identified by `TER` records and by changes of chain ID, in file
-order. If your file is the other way round, or has more than two chains, say
-so explicitly instead of reordering the file:
+`--peptide_chain` is **required**, because picking the wrong molecule produces
+perfectly plausible numbers for the wrong thing rather than an error. There is
+no default to get silently wrong:
 
 ```bash
-python run_bpmd.py --lig_chain 2 --prot_chain 1
+python run_bpmd.py --peptide_chain 1          # peptide first in the file
+python run_bpmd.py --peptide_chain 2          # receptor first in the file
 ```
 
-Stage 2 prints the chains it detected and the residues it assigned to each
-before any simulation starts — **always check those two lines**, because a
-wrong assignment produces plausible-looking numbers for the wrong molecule.
+`--receptor_chain` only needs to be given when the complex has **more than two
+chains** — with exactly two, the receptor is the other one and the script says
+which it picked. For a receptor that is itself a dimer, or a complex with
+cofactor chains, be explicit:
+
+```bash
+python run_bpmd.py --peptide_chain 3 --receptor_chain 1
+```
+
+Stage 2 prints every chain it detected, with its residue range, and then the
+peptide and receptor it assigned — all before any simulation starts. **Check
+those lines on the first run.** If you do not know the numbering yet, run it
+once with any value and read the list off the output.
 
 **3. Keep the header `SSBOND` records** if the structure has disulfides.
 They are read from the *original* PDB, because pdb2pqr discards header lines.
@@ -286,8 +300,8 @@ the RMSD well defined under periodic boundary conditions.
 | `--work_dir` | `./` | Directory holding the per-complex directories from stage 1 |
 | `--complex` | all | Names of the complexes to run |
 | `--output` | `peptide_pose` | Name of the output directory created inside each complex directory |
-| `--lig_chain` | `1` | 1-based index of the chain that is the **peptide** |
-| `--prot_chain` | `2` | 1-based index of the chain that is the **receptor** |
+| `--peptide_chain` | **required** | 1-based index of the chain that is the **peptide** — the molecule that is biased and scored |
+| `--receptor_chain` | inferred | 1-based index of the chain that is the **receptor**. Optional only for a two-chain complex |
 | `--nreps` | `10` | Number of replicas, run in series |
 | `--hill_height` | `0.5` | Metadynamics hill height (kcal/mol) |
 | `--sim_time` | `10.0` | Length of each replica (ns) |
@@ -405,6 +419,12 @@ Both stages are restartable, and both skip work that is already on disk:
 - Stage 2 reuses `minimized_system.pdb` and `equil_system.pdb` if they exist,
   and skips any replica that already has a `bpm_results.csv`.
 
+When re-running to pick up extra replicas, **pass the same `--sim_time` you
+originally used.** The scoring window is expressed in nanoseconds, so the
+script works out "the last 2 ns" from the replica length you give it — tell it
+10 ns when the replicas are 5 ns long and it will average the wrong window.
+The value used is recorded in `output_info.txt`.
+
 To rerun a replica, **delete its whole directory** rather than individual
 files. An interrupted replica leaves `bias_*.npy` files behind, and OpenMM
 reads those back in on the next start, so the new run would continue the old
@@ -417,14 +437,14 @@ biased simulation instead of starting fresh. Stage 2 warns when it finds them.
 **`Could not find pdb2pqr on PATH`** — the conda environment is not active, or
 `pdb2pqr` is installed somewhere else. Pass `--pdb2pqr_exe /path/to/pdb2pqr30`.
 
-**`Asked for peptide chain 1 and receptor chain 2, but only 1 chain(s) were
-found`** — the `_ed.pdb` has no chain separation. Regenerate it with
+**`--peptide_chain N was requested, but only 1 chain(s) were found`** — the
+`_ed.pdb` has no chain separation. Regenerate it with
 `build_topology.py`; if your input PDB genuinely has a single chain ID for
 both molecules, add a `TER` between them or give them distinct chain IDs.
 
-**`The peptide ... selection matches no atoms`** — `--lig_chain` /
-`--prot_chain` point at the wrong chain, or the residues are not recognised as
-protein by MDAnalysis. Non-standard residues and the `NHE` terminal cap are
+**`The peptide ... selection matches no atoms`** — `--peptide_chain` /
+`--receptor_chain` point at the wrong chain, or the residues are not recognised
+as protein by MDAnalysis. Non-standard residues and the `NHE` terminal cap are
 not covered by MDAnalysis's `protein` keyword.
 
 **`MDTraj cannot read ...`** — the AMBER topology must end in `.prmtop`,
@@ -487,36 +507,40 @@ usability changes; the ones that **change your results** are marked.
 1. **A real command-line interface** — `argparse` was imported but unused, and
    the working directory was hard-coded to `/content/` (a Colab path). Every
    setting that was a module-level variable is now an option.
-2. **Chain detection no longer depends on `TER` alone**, and the fragile
+2. **The peptide chain is named explicitly** via the required
+   `--peptide_chain`, instead of the peptide being assumed to be the first
+   chain in the file. `--receptor_chain` is inferred for a two-chain complex
+   and required otherwise.
+3. **Chain detection no longer depends on `TER` alone**, and the fragile
    `pdb_file.split('.')[0]` / `name.split('/')[2]` path handling is gone — the
    latter only worked for paths of one exact depth.
-3. **The `-1` residue offset is detected, not assumed** — the analysis
+4. **The `-1` residue offset is detected, not assumed** — the analysis
    selections need it because MDTraj numbers residues from 0 while OpenMM
    numbers them from 1 (both verified). It is now measured from the files, so
    it cannot silently become wrong.
-4. **`not name *H*` → `not name H*`** in the contact selection
+5. **`not name *H*` → `not name H*`** in the contact selection
    *(changes results slightly)* — the glob `*H*` also excluded heavy atoms
    whose names contain an H, such as Arg `NH1`/`NH2` and Tyr `OH`, which are
    precisely the atoms that form interface contacts.
-5. **The hard-coded 99-frame score array** is now sized from the data, so
+6. **The hard-coded 99-frame score array** is now sized from the data, so
    `--sim_time` and the frame count can change without silently truncating or
    zero-padding the scores.
-6. **Velocities are initialised** from the Maxwell-Boltzmann distribution
+7. **Velocities are initialised** from the Maxwell-Boltzmann distribution
    *(changes results)* before equilibration and production, instead of starting
    from zero velocities.
-7. **Scoring windows are expressed in nanoseconds**, so "first 1 ns" and
+8. **Scoring windows are expressed in nanoseconds**, so "first 1 ns" and
    "last 2 ns" stay correct when `--sim_time` changes.
-8. `collect_results` no longer assumes contiguous replica numbering, skips
+9. `collect_results` no longer assumes contiguous replica numbering, skips
    missing or empty files instead of crashing, and pools replicas with
    `np.concatenate` so unequal lengths cannot raise.
-9. Selections are validated up front with actionable errors, instead of
+10. Selections are validated up front with actionable errors, instead of
    failing deep inside the analysis.
-10. The stale-bias-file hazard on restart is now reported.
-11. Written files are closed properly, and the aliasing between
+11. The stale-bias-file hazard on restart is now reported.
+12. Written files are closed properly, and the aliasing between
     `input_positions` and `positions` during restraint setup was removed.
-12. Docstrings corrected: the integrator uses 2 fs (not 4 fs), equilibration
+13. Docstrings corrected: the integrator uses 2 fs (not 4 fs), equilibration
     is 1 ns (not 500 ps), and bias is deposited every 0.5 ps (not 1 ps).
-13. Added GPU platform selection, a per-replica results file, and a
+14. Added GPU platform selection, a per-replica results file, and a
     per-complex error summary so one bad complex does not abort a batch.
 
 ---
