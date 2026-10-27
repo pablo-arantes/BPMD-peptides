@@ -193,28 +193,126 @@ print(subprocess.run([PY, "-c",
 cells.append(md(r"""
 ## 3. Where should the results go?
 
-**Google Drive is strongly recommended.** A full job is longer than one Colab
-session; with Drive you simply re-run step 5 in a new session and it picks up
-where it stopped. Without Drive, everything is lost on disconnect.
+The simulation runs on Colab's **local disk**, which is fast and reliable, and
+the results are **copied up to Google Drive** after the topology is built and
+after every replica finishes.
+
+It is tempting to point the whole job at Drive and skip the copying, but that
+does not work: Drive is a FUSE network mount, and under sustained writes it
+drops out with `Transport endpoint is not connected`, killing the run. It is
+also slow — a trajectory written frame by frame over a network mount is
+painful. So Drive is used as the place results are *saved to*, not the place
+they are *computed in*.
+
+**Mount Drive anyway.** Local disk is wiped when the session ends, and a full
+job is longer than one Colab session. With Drive, each finished replica is
+banked immediately, and re-running step 7 in a new session carries on from
+there. The cell below also checks the mount and remounts it if it has died.
 """))
 
 cells.append(code(r"""
-#@title Choose the working directory { display-mode: "form" }
+#@title Set up local scratch + Google Drive { display-mode: "form" }
 use_google_drive = True  #@param {type:"boolean"}
 drive_subfolder = "BPMD_peptides"  #@param {type:"string"}
+copy_trajectories_to_drive = True  #@param {type:"boolean"}
 
-import os
+import os, shutil, subprocess
+
+# Everything the simulation touches lives on local disk. Drive is only ever
+# written to in one go, by save_to_drive() below.
+LOCAL = "/content/work"
+WORK = LOCAL
+os.makedirs(LOCAL, exist_ok=True)
+
+DRIVE = None
 if use_google_drive:
     from google.colab import drive
     drive.mount("/content/drive")
-    WORK = f"/content/drive/MyDrive/{drive_subfolder}"
-else:
-    WORK = "/content/work"
-    print("NOT using Drive: results will be lost when this session ends.")
+    DRIVE = f"/content/drive/MyDrive/{drive_subfolder}"
+    os.makedirs(DRIVE, exist_ok=True)
 
-os.makedirs(WORK, exist_ok=True)
-print("Working directory:", WORK)
-print("Existing contents:", sorted(os.listdir(WORK)) or "(empty)")
+
+def drive_ok():
+    # The mount dies silently during long runs; this is how we notice.
+    if DRIVE is None:
+        return False
+    try:
+        os.listdir(DRIVE)
+        return True
+    except OSError:
+        return False
+
+
+def remount_drive():
+    print("  Drive mount is not responding -- remounting ...")
+    from google.colab import drive
+    try:
+        drive.flush_and_unmount()
+    except Exception:
+        pass
+    drive.mount("/content/drive", force_remount=True)
+    os.makedirs(DRIVE, exist_ok=True)
+
+
+def _mirror(src, dst):
+    os.makedirs(dst, exist_ok=True)
+    skip_dcd = not copy_trajectories_to_drive
+    if shutil.which("rsync"):
+        cmd = ["rsync", "-a"]
+        if skip_dcd:
+            cmd += ["--exclude", "*.dcd"]
+        r = subprocess.run(cmd + [src + "/", dst + "/"],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            return
+        print("  rsync failed, copying file by file:", r.stderr[-200:])
+    for root, _, names in os.walk(src):
+        rel = os.path.relpath(root, src)
+        target = dst if rel == "." else os.path.join(dst, rel)
+        os.makedirs(target, exist_ok=True)
+        for n in names:
+            if skip_dcd and n.endswith(".dcd"):
+                continue
+            shutil.copy2(os.path.join(root, n), os.path.join(target, n))
+
+
+def save_to_drive(name=None):
+    # Bank local results on Drive. Safe to call as often as you like.
+    if DRIVE is None:
+        return
+    if not drive_ok():
+        remount_drive()
+    src = LOCAL if name is None else os.path.join(LOCAL, name)
+    dst = DRIVE if name is None else os.path.join(DRIVE, name)
+    if not os.path.isdir(src):
+        return
+    try:
+        _mirror(src, dst)
+        print(f"  saved to Drive: {dst}")
+    except OSError as e:
+        print(f"  WARNING: could not save to Drive ({e}).")
+        print(f"  Your results are still in {src}. Re-run this cell to retry,")
+        print(f"  but do not end the session before they are saved.")
+
+
+def restore_from_drive(name):
+    # Pull an earlier session's results for one complex back to local disk.
+    if DRIVE is None:
+        return False
+    if not drive_ok():
+        remount_drive()
+    src = os.path.join(DRIVE, name)
+    if not os.path.isdir(src):
+        return False
+    _mirror(src, os.path.join(LOCAL, name))
+    return True
+
+
+print("Computing in:", LOCAL)
+print("Saving to   :", DRIVE or "NOWHERE -- results are lost when this "
+                                "session ends")
+if DRIVE:
+    print("Already on Drive:", sorted(os.listdir(DRIVE)) or "(empty)")
 """))
 
 cells.append(md(r"""
@@ -270,6 +368,18 @@ else:
 PDB_PATH = dest
 print(f"Structure: {PDB_PATH}")
 
+save_to_drive("inputs")        # keep a copy of exactly what was run
+
+# If an earlier session already did some of this complex, bring it back
+if restore_from_drive(COMPLEX):
+    done = os.path.join(LOCAL, COMPLEX, "peptide_pose")
+    reps = len([d for d in os.listdir(done)
+                if d.startswith("rep_") and os.path.isfile(
+                    os.path.join(done, d, "bpm_results.csv"))]) \
+        if os.path.isdir(done) else 0
+    print(f"\nRestored '{COMPLEX}' from Drive: {reps} finished replica(s). "
+          f"Step 7 will carry on from there.")
+
 # Report what is in the file, so surprises surface now and not later
 chains, ssbond, hetero = {}, 0, set()
 with open(PDB_PATH) as fh:
@@ -315,8 +425,25 @@ titration_method = "propka"  #@param ["propka", "none"]
 inter_chain_disulfides = "no"  #@param ["no", "yes"]
 box_buffer_angstrom = 10.0  #@param {type:"number"}
 salt_concentration_M = 0.15  #@param {type:"number"}
+rebuild_if_already_built = False  #@param {type:"boolean"}
 
 import subprocess, sys
+
+PRMTOP = f"{WORK}/{COMPLEX}/{COMPLEX}_amber.prmtop"
+INPCRD = f"{WORK}/{COMPLEX}/{COMPLEX}_amber.inpcrd"
+
+def already_built():
+    # Both files, and not truncated: a dropped Drive mount can leave a
+    # half-written topology behind, which must not be mistaken for a good one.
+    return (os.path.isfile(PRMTOP) and os.path.getsize(PRMTOP) > 1000
+            and os.path.isfile(INPCRD) and os.path.getsize(INPCRD) > 100)
+
+if already_built() and not rebuild_if_already_built:
+    print(f"Topology already built: {PRMTOP}")
+    print("Skipping. (tleap places the salt ions randomly, so rebuilding "
+          "makes a topology that does not match replicas you have already "
+          "run. Tick 'rebuild_if_already_built' only if you mean it.)")
+    raise SystemExit  # ends this cell only, not the notebook
 
 cmd = [PY, "-u", f"{REPO}/build_topology.py",   # -u: stream progress live
        "--input_dir", INPUT_DIR, "--work_dir", WORK,
@@ -335,12 +462,15 @@ for line in proc.stdout:          # stream it, the run takes a minute or two
     sys.stdout.write(line)
 proc.wait()
 
-PRMTOP = f"{WORK}/{COMPLEX}/{COMPLEX}_amber.prmtop"
 if proc.returncode != 0 or not os.path.isfile(PRMTOP):
     raise RuntimeError(
         "Topology generation failed. Scroll up for the reason; the tleap logs "
-        f"are in {WORK}/{COMPLEX}/*.log")
+        f"are in {WORK}/{COMPLEX}/*.log. A 'Transport endpoint is not "
+        "connected' error means the Drive mount dropped -- re-run step 3 to "
+        "remount, then this cell again.")
+
 print(f"\nTopology ready: {PRMTOP}")
+save_to_drive(COMPLEX)
 """))
 
 cells.append(md(r"""
@@ -388,9 +518,9 @@ cells.append(md(r"""
 The published protocol is **10 replicas × 10 ns**. On a T4 that is well beyond
 one Colab session for a typical complex, so the defaults below are smaller.
 
-- **Nothing is wasted.** Each finished replica is scored and saved
-  immediately. If Colab disconnects, re-run this cell in a new session (with
-  Drive mounted) and it resumes at the next unfinished replica.
+- **Nothing is wasted.** Replicas are run one at a time and each is copied
+  to Drive the moment it is scored. If Colab disconnects, re-run this cell in
+  a new session and it resumes at the next unfinished replica.
 - **Start small.** Run `replicas = 1`, `sim_time = 1` first to confirm the
   whole thing works on your system and to measure the speed, then increase.
 - **The scoring window is the last 2 ns**, so `sim_time` below 2 ns averages
@@ -409,32 +539,65 @@ equilibration_ps = 500.0  #@param {type:"number"}
 hill_height_kcal = 0.5  #@param {type:"number"}
 temperature_K = 300.0  #@param {type:"number"}
 
-import subprocess, sys, time
-
-cmd = [PY, "-u", f"{REPO}/run_bpmd.py",         # -u: stream progress live
-       "--work_dir", WORK, "--complex", COMPLEX,
-       "--peptide_chain", str(peptide_chain),
-       "--nreps", str(replicas),
-       "--sim_time", str(sim_time_ns),
-       "--equil_time", str(equilibration_ps),
-       "--hill_height", str(hill_height_kcal),
-       "--temperature", str(temperature_K),
-       "--platform", "CUDA" if HAS_GPU else "CPU"]
-if receptor_chain > 0:                 # 0 means "infer it"
-    cmd += ["--receptor_chain", str(receptor_chain)]
-
-print(" ".join(cmd), "\n")
-t0 = time.time()
-proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        text=True, bufsize=1, env=os.environ)
-for line in proc.stdout:
-    sys.stdout.write(line)
-proc.wait()
-print(f"\nElapsed: {(time.time()-t0)/60:.1f} min")
-if proc.returncode != 0:
-    raise RuntimeError("The run failed -- scroll up for the reason.")
+import glob, subprocess, sys, time
 
 POSE_DIR = f"{WORK}/{COMPLEX}/peptide_pose"
+
+base_cmd = [PY, "-u", f"{REPO}/run_bpmd.py",    # -u: stream progress live
+            "--work_dir", WORK, "--complex", COMPLEX,
+            "--peptide_chain", str(peptide_chain),
+            "--sim_time", str(sim_time_ns),
+            "--equil_time", str(equilibration_ps),
+            "--hill_height", str(hill_height_kcal),
+            "--temperature", str(temperature_K),
+            "--platform", "CUDA" if HAS_GPU else "CPU"]
+if receptor_chain > 0:                 # 0 means "infer it"
+    base_cmd += ["--receptor_chain", str(receptor_chain)]
+
+
+def finished_replicas():
+    return sorted(glob.glob(os.path.join(POSE_DIR, "rep_*",
+                                         "bpm_results.csv")))
+
+
+# One replica per call, so each one is banked on Drive as soon as it is
+# scored. The script skips replicas that are already done, which is what
+# makes this resumable across sessions. '--nreps n' means "make sure n
+# replicas exist", so asking for one more than are finished adds exactly one.
+t0 = time.time()
+for _ in range(replicas):
+    before = len(finished_replicas())
+    if before >= replicas:
+        break
+    print(f"\n{'='*64}")
+    print(f"  replica {before + 1} of {replicas}   "
+          f"(elapsed {(time.time()-t0)/60:.1f} min)")
+    print(f"{'='*64}")
+
+    proc = subprocess.Popen(base_cmd + ["--nreps", str(before + 1)],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            text=True, bufsize=1, env=os.environ)
+    for line in proc.stdout:
+        sys.stdout.write(line)
+    proc.wait()
+
+    save_to_drive(COMPLEX)        # bank whatever progress was made
+
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "The run failed -- scroll up for the reason. Anything already "
+            "finished has been saved to Drive, so re-running this cell "
+            "resumes rather than starting over. A 'Transport endpoint is "
+            "not connected' error means the Drive mount dropped: re-run "
+            "step 3 to remount, then this cell.")
+    if len(finished_replicas()) == before:
+        raise RuntimeError(
+            f"Replica {before + 1} did not produce a bpm_results.csv and the "
+            f"script reported no error. Stopping rather than looping.")
+
+print(f"\n{len(finished_replicas())} replica(s) finished in "
+      f"{(time.time()-t0)/60:.1f} min")
 print("Results in:", POSE_DIR)
 """))
 
@@ -525,6 +688,7 @@ fig.tight_layout()
 out_png = os.path.join(POSE_DIR, "scores.png")
 fig.savefig(out_png, dpi=150, bbox_inches="tight")
 print("Saved:", out_png)
+save_to_drive(COMPLEX)          # bank the figure alongside the scores
 plt.show()
 """))
 
@@ -591,10 +755,12 @@ load_traj rep_1/trj.dcd
 
 The published protocol is 10 replicas × 10 ns. To get there on Colab:
 
-1. Mount Drive (step 3) so nothing is lost.
-2. Set `replicas = 10` and `sim_time_ns = 10`, and keep those values fixed.
-3. Re-run step 7 whenever the session drops. Finished replicas are skipped,
-   so each session adds a few more.
+1. Mount Drive (step 3) so each replica is banked as it finishes.
+2. Set `replicas = 10` and `sim_time_ns = 10`, and keep those values fixed —
+   the scoring window is derived from `sim_time_ns`, so changing it between
+   sessions averages the wrong part of the trajectory.
+3. Re-run steps 3, 4 and 7 whenever the session drops. Step 4 pulls your
+   finished replicas back from Drive and step 7 carries on from there.
 
 If a replica is interrupted mid-run, **delete its whole `rep_N` directory**
 before resuming. A partial replica leaves metadynamics bias files behind, and

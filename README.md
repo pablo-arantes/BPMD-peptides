@@ -24,10 +24,17 @@ If you do not have a GPU or a cluster, open
 runtime to a T4 GPU and work through the cells. It installs everything,
 fetches or accepts your structure, runs both stages and plots the scores.
 
-Colab sessions are time-limited, so mount Google Drive when the notebook asks:
-finished replicas are skipped on re-run, which means a full 10 × 10 ns job can
-be completed across several sessions. Start with one short replica to check
-your system and measure the speed before committing to the full protocol.
+The notebook computes on Colab's local disk and copies results to Google
+Drive after the topology is built and after every replica. Drive is a network
+mount that drops out under sustained writes (`Transport endpoint is not
+connected`), so it is used as the place results are saved to, not the place
+they are computed in.
+
+Mount Drive when the notebook asks. Colab sessions are shorter than a full
+10 × 10 ns job, but each finished replica is banked as it completes and
+re-running the simulation cell resumes from there, so a long job can be
+finished across several sessions. Start with one short replica to check your
+system and measure the speed before committing to the full protocol.
 
 ---
 
