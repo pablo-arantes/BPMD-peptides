@@ -1,0 +1,29 @@
+# Conda environment for BPMD-peptides.
+#
+#   conda env create -f environment.yml
+#   conda activate bpmd-peptides
+#
+# This mirrors a verified working combination (osx-arm64 and linux-64).
+# For GPU runs on Linux, install a CUDA-enabled OpenMM afterwards:
+#   conda install -c conda-forge openmm cuda-version=12
+name: bpmd-peptides
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  # --- stage 1: topology generation ---
+  - ambertools>=23          # provides tleap
+  - pymol-open-source>=3.0
+  # --- stage 2: simulation and analysis ---
+  - openmm>=7.7
+  - mdtraj>=1.9.9
+  # --- shared ---
+  - numpy<2                 # mdtraj/MDAnalysis builds here are numpy 1.x
+  - pandas>=2.0
+  - scipy
+  - netcdf4
+  - pip
+  - pip:
+      - MDAnalysis>=2.7
+      - biopandas>=0.5
+      - pdb2pqr>=3.6        # pulls in propka

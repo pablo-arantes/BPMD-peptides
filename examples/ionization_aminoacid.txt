@@ -1,0 +1,31 @@
+# Manual protonation-state overrides for build_topology.py
+#
+#   python build_topology.py --ion_aminoacid_list examples/ionization_aminoacid.txt
+#
+# One residue per line, tab- or space-separated:
+#
+#   RESNAME  RESID  [CHAIN]
+#
+# RESID refers to the numbering in your ORIGINAL input PDB. If the CHAIN
+# column is omitted, the override is applied to that residue number in every
+# chain. Lines starting with '#' are ignored.
+#
+# These override whatever PROPKA assigned at the requested pH. Each request is
+# checked against the residue's ionization family, so an override that does not
+# match the residue actually present is reported and skipped.
+#
+# Available states:
+#   GLU / GLH          deprotonated / protonated (neutral) glutamate
+#   ASP / ASH          deprotonated / protonated (neutral) aspartate
+#   HIS / HID / HIE / HIP
+#                      HID = proton on ND1, HIE = proton on NE2,
+#                      HIP = doubly protonated (+1)
+#   CYS / CYX          free cysteine / disulfide-bonded cysteine
+#   LYS / LYN          protonated (+1) / neutral lysine
+#
+# Delete the examples below and add your own.
+
+GLH	35	A
+HIP	64
+ASH	102	B
+LYN	15	A

@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Simulation inputs/outputs produced by the pipeline
+*.prmtop
+*.inpcrd
+*.parm7
+*.rst7
+*.pqr
+*.dcd
+*.npy
+*.log
+*_pka.pdb
+*_pymol.pdb
+*_ed.pdb
+*_tleap.in
+leap.log
+peptide_pose/
+rep_*/
+output_info.txt
+results.csv
+results_per_replica.csv
+bpm_results.csv
+
+# OS
+.DS_Store
