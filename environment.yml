@@ -3,7 +3,14 @@
 #   conda env create -f environment.yml
 #   conda activate bpmd-peptides
 #
-# This mirrors a verified working combination (osx-arm64 and linux-64).
+# Verified: this file solves cleanly on osx-arm64 (conda-forge only), giving
+# ambertools 24.8, openmm 8.6, pymol-open-source 3.1, mdtraj 1.10 and
+# numpy 1.26. The pipeline itself was run on osx-arm64 with openmm 7.7.
+# All four conda packages are also published for linux-64.
+#
+# python is pinned to 3.10 because that is the tested combination; later
+# versions are likely fine, but have not been checked here.
+#
 # For GPU runs on Linux, install a CUDA-enabled OpenMM afterwards:
 #   conda install -c conda-forge openmm cuda-version=12
 name: bpmd-peptides
